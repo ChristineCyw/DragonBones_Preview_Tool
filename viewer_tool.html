@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>DragonBones 通用预览器（本地版）</title>
+
+<!-- 本地库（顺序不能改） -->
+<script src="./libs/pixi.min.js"></script>
+<script src="./libs/dragonBones.core.js"></script>
+<script src="./libs/dragonBones.pixi.js"></script>
+
+<style>
+  :root { --bg:#000; --panel:#111; --text:#ddd; --accent:#4fc3f7;}
+  html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font:12px/1.4 ui-sans-serif,system-ui,Segoe UI,Arial}
+  #app { position:absolute; inset:0 0 56px 0; }
+  #panel { position:fixed; left:0; right:0; bottom:0; height:56px; display:flex; gap:10px; align-items:center;
+           background:var(--panel); border-top:1px solid #222; padding:8px 12px; box-sizing:border-box; }
+  #panel .group { display:flex; align-items:center; gap:8px; }
+  #drop { position:fixed; inset:0; pointer-events:none; display:none; align-items:center; justify-content:center;
+          background:rgba(79,195,247,.1); border:3px dashed var(--accent); color:var(--accent); font-size:20px; }
+  #panel select, #panel input[type="color"], #panel input[type="number"] {
+    background:#1a1a1a; color:var(--text); border:1px solid #333; border-radius:6px; padding:4px 6px;
+  }
+  #panel button { background:#222; color:var(--text); border:1px solid #333; border-radius:8px; padding:6px 10px; cursor:pointer; }
+  #panel button:hover{ background:#2a2a2a }
+  .grow{ flex:1 }
+  #hint{opacity:.8}
+</style>
+</head>
+<body>
+<div id="app"></div>
+
+<!-- 拖拽提示 -->
+<div id="drop">释放文件到此处（支持 *_ske.json / *_tex.json / .png）</div>
+
+<!-- 控制面板 -->
+<div id="panel">
+  <div class="group">
+    <input id="file" type="file" multiple accept=".json,.png" />
+    <button id="demoBtn" title="加载当前目录 danyao_* 示例">加载示例</button>
+    <span id="hint">或直接把文件拖进窗口</span>
+  </div>
+
+  <div class="group">
+    骨架
+    <select id="armSel"></select>
+    动画
+    <select id="animSel"></select>
+    <button id="prev">◀</button>
+    <button id="play">⏵︎/⏸</button>
+    <button id="next">▶</button>
+    循环 <input id="loop" type="checkbox" checked />
+    速度 <input id="speed" type="number" step="0.1" min="0.1" value="1.0" style="width:64px" />
+  </div>
+
+  <div class="group">
+    背景 <input id="bg" type="color" value="#000000" />
+    <button id="fit">适配窗口</button>
+    <span class="grow"></span>
+    <span id="status"></span>
+  </div>
+</div>
+
+<script>
+/* ---------------- 状态与工具 ---------------- */
+const LS_KEY = 'db_viewer_settings_v1';
+const $ = sel => document.querySelector(sel);
+const state = {
+  app: null,
+  factory: null,
+  armatureDisplay: null,
+  skeData: null,
+  texData: null,
+  baseTex: null,
+  animations: [],
+  dragging: false, lastX:0, lastY:0, scale:1,
+};
+
+function saveSettings() {
+  const s = {
+    bg: $('#bg').value,
+    loop: $('#loop').checked,
+    speed: parseFloat($('#speed').value || '1'),
+  };
+  localStorage.setItem(LS_KEY, JSON.stringify(s));
+}
+function loadSettings() {
+  try {
+    const s = JSON.parse(localStorage.getItem(LS_KEY) || '{}');
+    if (s.bg) $('#bg').value = s.bg;
+    if (typeof s.loop === 'boolean') $('#loop').checked = s.loop;
+    if (s.speed) $('#speed').value = s.speed;
+  } catch(e){}
+}
+
+/* ---------------- 初始化 PIXI ---------------- */
+function initPixi() {
+  const bgHex = parseInt($('#bg').value.slice(1), 16);
+  state.app = new PIXI.Application({ backgroundColor: bgHex, resizeTo: window, antialias: true });
+  $('#app').appendChild(state.app.view);
+
+  // 缩放 & 拖拽
+  state.app.view.addEventListener('wheel', (e)=>{
+    e.preventDefault();
+    const factor = e.deltaY < 0 ? 1.1 : 0.9;
+    state.scale = Math.max(0.1, Math.min(5, state.scale * factor));
+    if (state.armatureDisplay) state.armatureDisplay.scale.set(state.scale);
+  }, {passive:false});
+
+  state.app.view.addEventListener('mousedown', (e)=>{
+    state.dragging = true; state.lastX = e.clientX; state.lastY = e.clientY;
+  });
+  window.addEventListener('mouseup', ()=>state.dragging=false);
+  window.addEventListener('mousemove', (e)=>{
+    if(!state.dragging || !state.armatureDisplay) return;
+    const dx = e.clientX - state.lastX, dy = e.clientY - state.lastY;
+    state.armatureDisplay.x += dx; state.armatureDisplay.y += dy;
+    state.lastX = e.clientX; state.lastY = e.clientY;
+  });
+}
+
+/* ---------------- 文件读取 ---------------- */
+function detectFiles(fileList){
+  const out = { ske:null, tex:null, png:null };
+  for (const f of fileList){
+    const name = f.name.toLowerCase();
+    if (name.endsWith('_ske.json') || name.endsWith('ske.json')) out.ske = f;
+    else if (name.endsWith('_tex.json') || name.endsWith('tex.json')) out.tex = f;
+    else if (name.endsWith('.png')) out.png = f;
+  }
+  return out;
+}
+
+function readText(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsText(file); }); }
+function readURL(file){ return URL.createObjectURL(file); }
+
+/* ---------------- 载入并构建 ---------------- */
+async function loadFromFiles(fileList){
+  const files = detectFiles(fileList);
+  if (!files.ske || !files.tex) { setStatus('请提供 *_ske.json 与 *_tex.json（可选提供 png）'); return; }
+
+  const skeJson = JSON.parse(await readText(files.ske));
+  const texJson = JSON.parse(await readText(files.tex));
+  const pngUrl  = files.png ? readURL(files.png) : null;
+
+  // 如果没给 png，用 tex.json 里的 imagePath
+  const imgPath = texJson.imagePath || 'danyao_tex.png';
+  const baseTex = PIXI.BaseTexture.from(pngUrl || imgPath);
+
+  buildScene(skeJson, texJson, baseTex);
+}
+
+function buildScene(skeJson, texJson, baseTex){
+  // 清场
+  state.app.stage.removeChildren();
+  state.factory = dragonBones.PixiFactory.factory;
+  // 重新 new 一个 Factory，避免污染（不同版本库用共享 factory 也可以）
+  state.factory = new dragonBones.PixiFactory();
+
+  state.factory.parseDragonBonesData(skeJson);
+  state.factory.parseTextureAtlasData(texJson, baseTex);
+
+  // 取第一个 armature
+  const armatures = (skeJson.armature || []).map(a=>a.name);
+  if (armatures.length===0) { setStatus('未找到 armature'); return; }
+  fillSelect($('#armSel'), armatures);
+
+  // 默认选择第一个并构建
+  buildArmature($('#armSel').value);
+
+  // 动画列表
+  updateAnimationList(skeJson);
+  fitToCenter();
+  setStatus(`加载完成：armatures=${armatures.length}, animations=${state.animations.length}`);
+}
+
+function updateAnimationList(skeJson){
+  const armName = $('#armSel').value;
+  const arm = (skeJson.armature || []).find(a => a.name === armName) || (skeJson.armature||[])[0];
+  const anims = (arm.animation || []).map(a => a.name);
+  state.animations = anims.length ? anims : ['default'];
+  fillSelect($('#animSel'), state.animations);
+}
+
+function buildArmature(armName){
+  if (state.armatureDisplay) {
+    state.armatureDisplay.removeFromParent();
+    state.armatureDisplay.dispose && state.armatureDisplay.dispose();
+  }
+  state.armatureDisplay = state.factory.buildArmatureDisplay(armName);
+  if (!state.armatureDisplay) { setStatus('无法创建骨架：'+armName); return; }
+
+  state.app.stage.addChild(state.armatureDisplay);
+  state.scale = 1;
+  playCurrentAnimation();
+}
+
+function playCurrentAnimation(){
+  const anim = $('#animSel').value;
+  const loop = $('#loop').checked ? 0 : 1;
+  const spd  = parseFloat($('#speed').value || '1');
+  try{
+    state.armatureDisplay.animation.timeScale = spd;
+    state.armatureDisplay.animation.play(anim, loop);
+  }catch(e){
+    state.armatureDisplay.animation.play(null, loop);
+  }
+}
+
+/* ---------------- UI 绑定 ---------------- */
+function fillSelect(sel, arr){
+  sel.innerHTML = arr.map(v=>`<option value="${v}">${v}</option>`).join('');
+}
+
+function fitToCenter(){
+  if(!state.armatureDisplay) return;
+  const w = state.app.renderer.width, h = state.app.renderer.height;
+  state.armatureDisplay.x = w/2; state.armatureDisplay.y = h/2;
+  // 以 800x600 为参考（DragonBones 默认画布）
+  const s = Math.min(w/800, h/600) * 1.0;
+  state.scale = s; state.armatureDisplay.scale.set(s);
+}
+function setStatus(t){ $('#status').textContent = t; }
+
+function bindUI(){
+  // 文件选择
+  $('#file').addEventListener('change', e => loadFromFiles(e.target.files));
+
+  // 示例按钮（假设在同目录存在 danyao_* 三件套）
+  $('#demoBtn').addEventListener('click', async ()=>{
+    const loader = new PIXI.Loader();
+    loader.add('ske','danyao_ske.json').add('tex','danyao_tex.json').load((_,res)=>{
+      const baseTex = PIXI.BaseTexture.from(res.tex.data.imagePath || 'danyao_tex.png');
+      buildScene(res.ske.data, res.tex.data, baseTex);
+    });
+  });
+
+  // 下拉切换
+  $('#armSel').addEventListener('change', ()=>{ buildArmature($('#armSel').value); updateAnimationList(state.skeData || {}); });
+  $('#animSel').addEventListener('change', playCurrentAnimation);
+
+  // 播放控制
+  $('#play').addEventListener('click', ()=>{
+    if(!state.armatureDisplay) return;
+    const anim = state.armatureDisplay.animation;
+    if (anim.isPlaying) anim.stop();
+    else playCurrentAnimation();
+  });
+  $('#prev').addEventListener('click', ()=>{
+    const list = state.animations; if(!list.length) return;
+    const i = Math.max(0, list.indexOf($('#animSel').value));
+    const ni = (i-1+list.length)%list.length;
+    $('#animSel').value = list[ni]; playCurrentAnimation();
+  });
+  $('#next').addEventListener('click', ()=>{
+    const list = state.animations; if(!list.length) return;
+    const i = Math.max(0, list.indexOf($('#animSel').value));
+    const ni = (i+1)%list.length;
+    $('#animSel').value = list[ni]; playCurrentAnimation();
+  });
+
+  // 其他设置
+  $('#loop').addEventListener('change', ()=>{ saveSettings(); playCurrentAnimation(); });
+  $('#speed').addEventListener('change', ()=>{ saveSettings(); playCurrentAnimation(); });
+  $('#bg').addEventListener('change', ()=>{
+    saveSettings();
+    const c = parseInt($('#bg').value.slice(1), 16);
+    state.app.renderer.backgroundColor = c;
+  });
+  $('#fit').addEventListener('click', fitToCenter);
+
+  // 拖拽加载
+  const drop = $('#drop');
+  window.addEventListener('dragover', e=>{ e.preventDefault(); drop.style.display='flex'; drop.style.pointerEvents='auto'; });
+  window.addEventListener('dragleave', e=>{ drop.style.display='none'; drop.style.pointerEvents='none'; });
+  window.addEventListener('drop', e=>{
+    e.preventDefault(); drop.style.display='none'; drop.style.pointerEvents='none';
+    if (e.dataTransfer?.files?.length) loadFromFiles(e.dataTransfer.files);
+  });
+
+  // 窗口变化
+  window.addEventListener('resize', fitToCenter);
+}
+
+/* ---------------- 启动 ---------------- */
+(function start(){
+  if(!window.PIXI || !window.dragonBones){ alert('未加载本地库：请确保 libs/ 中三个 js 存在且先后顺序正确'); return; }
+  loadSettings();
+  initPixi();
+  bindUI();
+  setStatus('等待加载文件：拖入 *_ske.json、*_tex.json、.png（可选）');
+})();
+</script>
+</body>
+</html>
