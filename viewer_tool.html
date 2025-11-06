@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>DragonBones 通用预览器（本地版）</title>
+<title>DragonBones 通用预览器（一次授权后一键重载 + 保持缩放位置）</title>
 
 <!-- 本地库（顺序不能改） -->
 <script src="./libs/pixi.min.js"></script>
@@ -13,9 +13,9 @@
 <style>
   :root { --bg:#000; --panel:#111; --text:#ddd; --accent:#4fc3f7;}
   html,body { height:100%; margin:0; background:var(--bg); color:var(--text); font:12px/1.4 ui-sans-serif,system-ui,Segoe UI,Arial}
-  #app { position:absolute; inset:0 0 56px 0; }
-  #panel { position:fixed; left:0; right:0; bottom:0; height:56px; display:flex; gap:10px; align-items:center;
-           background:var(--panel); border-top:1px solid #222; padding:8px 12px; box-sizing:border-box; }
+  #app { position:absolute; inset:0 0 64px 0; }
+  #panel { position:fixed; left:0; right:0; bottom:0; height:64px; display:flex; gap:12px; align-items:center;
+           background:var(--panel); border-top:1px solid #222; padding:8px 12px; box-sizing:border-box; flex-wrap:wrap }
   #panel .group { display:flex; align-items:center; gap:8px; }
   #drop { position:fixed; inset:0; pointer-events:none; display:none; align-items:center; justify-content:center;
           background:rgba(79,195,247,.1); border:3px dashed var(--accent); color:var(--accent); font-size:20px; }
@@ -24,29 +24,29 @@
   }
   #panel button { background:#222; color:var(--text); border:1px solid #333; border-radius:8px; padding:6px 10px; cursor:pointer; }
   #panel button:hover{ background:#2a2a2a }
-  .grow{ flex:1 }
+  .grow{ flex:1 1 auto; min-width:120px }
   #hint{opacity:.8}
+  #status{opacity:.9}
+  input[type="file"]{ display:none; }
 </style>
 </head>
 <body>
 <div id="app"></div>
 
-<!-- 拖拽提示 -->
 <div id="drop">释放文件到此处（支持 *_ske.json / *_tex.json / .png）</div>
 
-<!-- 控制面板 -->
 <div id="panel">
   <div class="group">
-    <input id="file" type="file" multiple accept=".json,.png" />
-    <button id="demoBtn" title="加载当前目录 danyao_* 示例">加载示例</button>
-    <span id="hint">或直接把文件拖进窗口</span>
+    <button id="pickVisible">选择文件</button>
+    <input id="filePick" type="file" multiple accept=".json,.png" />
+    <button id="demoBtn">加载示例</button>
+    <button id="reloadBtn">重新加载</button>
+    <span id="hint">或把文件拖进窗口</span>
   </div>
 
   <div class="group">
-    骨架
-    <select id="armSel"></select>
-    动画
-    <select id="animSel"></select>
+    骨架 <select id="armSel"></select>
+    动画 <select id="animSel"></select>
     <button id="prev">◀</button>
     <button id="play">⏵︎/⏸</button>
     <button id="next">▶</button>
@@ -54,7 +54,7 @@
     速度 <input id="speed" type="number" step="0.1" min="0.1" value="1.0" style="width:64px" />
   </div>
 
-  <div class="group">
+  <div class="group grow">
     背景 <input id="bg" type="color" value="#000000" />
     <button id="fit">适配窗口</button>
     <span class="grow"></span>
@@ -63,8 +63,21 @@
 </div>
 
 <script>
+/* ---------------- 简易 IndexedDB 工具（存放句柄） ---------------- */
+const DB_NAME='dbv1', STORE='handles';
+function idbPut(key, value){ return new Promise((res,rej)=>{ const r=indexedDB.open(DB_NAME,1);
+  r.onupgradeneeded=()=>r.result.createObjectStore(STORE);
+  r.onsuccess=()=>{ const tx=r.result.transaction(STORE,'readwrite'); tx.objectStore(STORE).put(value,key);
+    tx.oncomplete=()=>res(); tx.onerror=e=>rej(e); };
+  r.onerror=e=>rej(e); });}
+function idbGet(key){ return new Promise((res,rej)=>{ const r=indexedDB.open(DB_NAME,1);
+  r.onupgradeneeded=()=>r.result.createObjectStore(STORE);
+  r.onsuccess=()=>{ const tx=r.result.transaction(STORE,'readonly'); const g=tx.objectStore(STORE).get(key);
+    g.onsuccess=()=>res(g.result); g.onerror=e=>rej(e); };
+  r.onerror=e=>rej(e); });}
+
 /* ---------------- 状态与工具 ---------------- */
-const LS_KEY = 'db_viewer_settings_v1';
+const LS_KEY = 'db_viewer_settings_v3';
 const $ = sel => document.querySelector(sel);
 const state = {
   app: null,
@@ -75,7 +88,20 @@ const state = {
   baseTex: null,
   animations: [],
   dragging: false, lastX:0, lastY:0, scale:1,
+
+  // 上次来源/文件
+  lastSource: null, // 'http' | 'files'
+  lastHttp: null,   // { ske, tex, png }
+  lastFiles: null,  // { ske:File, tex:File, png?:File }
+  lastFileNames: null, // { skeName, texName, pngName? }
+
+  // 目录与文件句柄（一次授权后静默重载）
+  dirHandle: null,
+  fileHandles: null // { ske, tex, png? }
 };
+
+// 视图状态：用于重载后保持缩放/位置/动画
+const view = { has:false, x:0, y:0, scale:1, armName:null, animName:null, loop:true, speed:1, playing:true };
 
 function saveSettings() {
   const s = {
@@ -93,6 +119,43 @@ function loadSettings() {
     if (s.speed) $('#speed').value = s.speed;
   } catch(e){}
 }
+function setStatus(t){
+  const s = typeof t === 'string' ? t
+          : (t?.message || t?.statusText || t?.type || String(t));
+  $('#status').textContent = s;
+  console.warn('[status]', t);
+}
+
+/* ---- 捕获/恢复视图 ---- */
+function captureView() {
+  if (!state.armatureDisplay) { view.has=false; return; }
+  view.has=true;
+  view.x = state.armatureDisplay.x;
+  view.y = state.armatureDisplay.y;
+  view.scale = state.armatureDisplay.scale.x;
+  view.armName = $('#armSel').value || null;
+  const anim = state.armatureDisplay.animation;
+  view.animName = $('#animSel').value || anim?.lastAnimationName || null;
+  view.loop = $('#loop').checked;
+  view.speed = parseFloat($('#speed').value || '1');
+  view.playing = !!(anim?.isPlaying);
+}
+function applyView() {
+  if (!view.has || !state.armatureDisplay) return;
+  state.armatureDisplay.x = view.x;
+  state.armatureDisplay.y = view.y;
+  state.armatureDisplay.scale.set(view.scale);
+  if (view.armName && $('#armSel').querySelector(`[value="${view.armName}"]`))
+    $('#armSel').value = view.armName;
+  updateAnimationList(state.skeData || {});
+  if (view.animName && $('#animSel').querySelector(`[value="${view.animName}"]`))
+    $('#animSel').value = view.animName;
+  $('#loop').checked = view.loop;
+  $('#speed').value = view.speed;
+  const loop = view.loop ? 0 : 1;
+  state.armatureDisplay.animation.timeScale = view.speed;
+  if (view.playing) state.armatureDisplay.animation.play($('#animSel').value, loop);
+}
 
 /* ---------------- 初始化 PIXI ---------------- */
 function initPixi() {
@@ -100,7 +163,6 @@ function initPixi() {
   state.app = new PIXI.Application({ backgroundColor: bgHex, resizeTo: window, antialias: true });
   $('#app').appendChild(state.app.view);
 
-  // 缩放 & 拖拽
   state.app.view.addEventListener('wheel', (e)=>{
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.1 : 0.9;
@@ -123,7 +185,8 @@ function initPixi() {
 /* ---------------- 文件读取 ---------------- */
 function detectFiles(fileList){
   const out = { ske:null, tex:null, png:null };
-  for (const f of fileList){
+  const arr = Array.from(fileList || []);
+  for (const f of arr){
     const name = f.name.toLowerCase();
     if (name.endsWith('_ske.json') || name.endsWith('ske.json')) out.ske = f;
     else if (name.endsWith('_tex.json') || name.endsWith('tex.json')) out.tex = f;
@@ -131,50 +194,204 @@ function detectFiles(fileList){
   }
   return out;
 }
-
-function readText(file){ return new Promise((res,rej)=>{ const r=new FileReader(); r.onload=()=>res(r.result); r.onerror=rej; r.readAsText(file); }); }
+function readText(file){
+  return new Promise((res, rej)=>{
+    const r = new FileReader();
+    r.onload = ()=>res(r.result);
+    r.onerror = (e)=>{
+      const name = file?.name || '(unknown)';
+      rej(new Error(`读取文件失败：${name} (${e?.target?.error?.message||e.type})`));
+    };
+    r.readAsText(file);
+  });
+}
 function readURL(file){ return URL.createObjectURL(file); }
 
-/* ---------------- 载入并构建 ---------------- */
-async function loadFromFiles(fileList){
-  const files = detectFiles(fileList);
-  if (!files.ske || !files.tex) { setStatus('请提供 *_ske.json 与 *_tex.json（可选提供 png）'); return; }
+/* ---------------- 清理与重建（修复 removeFromParent） ---------------- */
+function teardown(){
+  try {
+    if (state.armatureDisplay) {
+      if (state.armatureDisplay.parent) {
+        state.armatureDisplay.parent.removeChild(state.armatureDisplay);
+      }
+      state.armatureDisplay.destroy && state.armatureDisplay.destroy({ children:true, texture:false, baseTexture:false });
+      state.armatureDisplay = null;
+    }
+    if (state.factory && state.factory.clear) state.factory.clear();
+    if (state.baseTex && state.baseTex.destroy) { state.baseTex.destroy(true); }
+    state.baseTex = null;
+    PIXI.utils?.clearTextureCache?.();
+  } catch(e) { /* ignore */ }
+}
+
+function buildScene(skeJson, texJson, baseTex, {preserve=false} = {}){
+  state.app.stage.removeChildren();
+  teardown();
+
+  state.factory = new dragonBones.PixiFactory();
+
+  state.skeData = skeJson;
+  state.texData = texJson;
+  state.baseTex = baseTex;
+
+  state.factory.parseDragonBonesData(skeJson);
+  state.factory.parseTextureAtlasData(texJson, baseTex);
+
+  const armatures = (skeJson.armature || []).map(a=>a.name);
+  if (armatures.length===0) { setStatus('未找到 armature'); return; }
+  fillSelect($('#armSel'), armatures);
+
+  buildArmature($('#armSel').value);
+  updateAnimationList(skeJson);
+
+  if (preserve && view.has) applyView();
+  else fitToCenter();
+
+  setStatus(`加载完成：armatures=${armatures.length}, animations=${state.animations.length}`);
+}
+
+/* ---------------- 载入：文件/路径 ---------------- */
+async function loadFromFilesList(filesArr, {preserve=false}={}){
+  const files = detectFiles(filesArr);
+  if (!files.ske || !files.tex) {
+    const need = state.lastFileNames
+      ? `（建议与上次相同：${state.lastFileNames.skeName || 'ske.json'} / ${state.lastFileNames.texName || 'tex.json'}${state.lastFileNames.pngName ? ' / '+state.lastFileNames.pngName : ''}）`
+      : '';
+    setStatus('请提供 *_ske.json 与 *_tex.json（可选 png）' + need);
+    return;
+  }
+
+  state.lastSource = 'files';
+  state.lastFiles  = files;
+  state.lastFileNames = {
+    skeName: files.ske?.name || null,
+    texName: files.tex?.name || null,
+    pngName: files.png?.name || null,
+  };
 
   const skeJson = JSON.parse(await readText(files.ske));
   const texJson = JSON.parse(await readText(files.tex));
   const pngUrl  = files.png ? readURL(files.png) : null;
 
-  // 如果没给 png，用 tex.json 里的 imagePath
-  const imgPath = texJson.imagePath || 'danyao_tex.png';
+  const imgPath = texJson.imagePath || state.lastFileNames.pngName || 'danyao_tex.png';
   const baseTex = PIXI.BaseTexture.from(pngUrl || imgPath);
 
-  buildScene(skeJson, texJson, baseTex);
+  buildScene(skeJson, texJson, baseTex, {preserve});
 }
 
-function buildScene(skeJson, texJson, baseTex){
-  // 清场
-  state.app.stage.removeChildren();
-  state.factory = dragonBones.PixiFactory.factory;
-  // 重新 new 一个 Factory，避免污染（不同版本库用共享 factory 也可以）
-  state.factory = new dragonBones.PixiFactory();
-
-  state.factory.parseDragonBonesData(skeJson);
-  state.factory.parseTextureAtlasData(texJson, baseTex);
-
-  // 取第一个 armature
-  const armatures = (skeJson.armature || []).map(a=>a.name);
-  if (armatures.length===0) { setStatus('未找到 armature'); return; }
-  fillSelect($('#armSel'), armatures);
-
-  // 默认选择第一个并构建
-  buildArmature($('#armSel').value);
-
-  // 动画列表
-  updateAnimationList(skeJson);
-  fitToCenter();
-  setStatus(`加载完成：armatures=${armatures.length}, animations=${state.animations.length}`);
+async function loadFromFiles(fileList, opts){
+  return loadFromFilesList(Array.from(fileList || []), opts);
 }
 
+/* ---------------- 一次性目录授权 + 持久化（静默重载） ---------------- */
+async function ensureDirHandles(){
+  // 优先尝试从 IndexedDB 恢复
+  if (!state.dirHandle || !state.fileHandles) {
+    const saved = await idbGet('handles');
+    if (saved?.dir && saved?.files) {
+      state.dirHandle = saved.dir;
+      state.fileHandles = saved.files;
+    }
+  }
+  if (state.dirHandle && state.fileHandles) return true;
+
+  if (!('showDirectoryPicker' in window)) return false;
+  if (!state.lastFileNames) return false;
+
+  setStatus('请选择包含资源的“所在目录”（仅此一次，以后将自动重载最新文件）');
+  const dir = await window.showDirectoryPicker();
+  state.dirHandle = dir;
+
+  const getHandleByName = async (name) => {
+    if (!name) return null;
+    try { return await dir.getFileHandle(name); } catch(e) { return null; }
+  };
+
+  const skeH = await getHandleByName(state.lastFileNames.skeName);
+  const texH = await getHandleByName(state.lastFileNames.texName);
+  const pngH = state.lastFileNames.pngName ? await getHandleByName(state.lastFileNames.pngName) : null;
+
+  if (!skeH || !texH) { setStatus('在所选目录未找到匹配文件，请确认目录是否正确。'); return false; }
+
+  state.fileHandles = { ske: skeH, tex: texH, png: pngH };
+
+  // 申请持久化存储，尽量避免权限被系统回收
+  try { await navigator.storage?.persist?.(); } catch(e){}
+
+  // 保存到 IndexedDB（FileSystemHandle 可序列化）
+  await idbPut('handles', { dir: state.dirHandle, files: state.fileHandles });
+
+  return true;
+}
+
+async function readFreshJSONfromHandle(h){
+  let p = await h.queryPermission({mode:'read'});
+  if (p !== 'granted') p = await h.requestPermission({mode:'read'});
+  if (p !== 'granted') throw new Error('未授予读取权限：' + (h.name||'file'));
+  const f = await h.getFile();
+  return JSON.parse(await f.text());
+}
+async function urlFromHandle(h){
+  if (!h) return null;
+  let p = await h.queryPermission({mode:'read'});
+  if (p !== 'granted') p = await h.requestPermission({mode:'read'});
+  if (p !== 'granted') throw new Error('未授予读取权限：' + (h.name||'file'));
+  const f = await h.getFile();
+  return URL.createObjectURL(f);
+}
+
+async function reloadFromHandles(){
+  const ok = await ensureDirHandles();
+  if (!ok) return false;
+  const skeJson = await readFreshJSONfromHandle(state.fileHandles.ske);
+  const texJson = await readFreshJSONfromHandle(state.fileHandles.tex);
+  const pngUrl  = await urlFromHandle(state.fileHandles.png);
+  const imgPath = texJson.imagePath || state.lastFileNames?.pngName || 'danyao_tex.png';
+  const baseTex = PIXI.BaseTexture.from(pngUrl || imgPath);
+  buildScene(skeJson, texJson, baseTex, {preserve:true});
+  return true;
+}
+
+/* ---------------- HTTP 路径加载（带强制绕缓存） ---------------- */
+function loadFromHttpPaths(paths, {preserve=false}={}){ // {ske, tex, png?}
+  state.lastSource = 'http';
+  state.lastHttp   = { ...paths };
+
+  const t = Date.now();
+  const loader = new PIXI.Loader();
+
+  try { loader.reset(); } catch(e){}
+  try { PIXI.utils?.clearTextureCache?.(); } catch(e){}
+
+  loader
+    .add('ske', addTs(paths.ske, t))
+    .add('tex', addTs(paths.tex, t));
+
+  loader.onError.add((err, loader, res) => {
+    const url = res?.url || '(unknown)';
+    setStatus(`加载失败：${url}  ${err?.message||err}`);
+    console.error('PIXI.Loader error:', err, res);
+  });
+
+  loader.load((_, res)=>{
+    try{
+      const imgPath = (res.tex?.data?.imagePath) || paths.png || 'danyao_tex.png';
+      const testImg = new Image();
+      testImg.onload = () => {
+        const baseTex = PIXI.BaseTexture.from(addTs(imgPath, t));
+        buildScene(res.ske.data, res.tex.data, baseTex, {preserve});
+      };
+      testImg.onerror = () => setStatus(`贴图加载失败：${imgPath}`);
+      testImg.src = addTs(imgPath, t);
+    }catch(e){
+      setStatus('解析 JSON 失败：' + (e?.message||e));
+      console.error(e);
+    }
+  });
+}
+function addTs(url, t){ return url.includes('?') ? `${url}&_t=${t}` : `${url}?_t=${t}`; }
+
+/* ---------------- 切换骨架/动画 ---------------- */
 function updateAnimationList(skeJson){
   const armName = $('#armSel').value;
   const arm = (skeJson.armature || []).find(a => a.name === armName) || (skeJson.armature||[])[0];
@@ -185,8 +402,8 @@ function updateAnimationList(skeJson){
 
 function buildArmature(armName){
   if (state.armatureDisplay) {
-    state.armatureDisplay.removeFromParent();
-    state.armatureDisplay.dispose && state.armatureDisplay.dispose();
+    if (state.armatureDisplay.parent) state.armatureDisplay.parent.removeChild(state.armatureDisplay);
+    state.armatureDisplay.destroy && state.armatureDisplay.destroy({ children:true, texture:false, baseTexture:false });
   }
   state.armatureDisplay = state.factory.buildArmatureDisplay(armName);
   if (!state.armatureDisplay) { setStatus('无法创建骨架：'+armName); return; }
@@ -212,35 +429,51 @@ function playCurrentAnimation(){
 function fillSelect(sel, arr){
   sel.innerHTML = arr.map(v=>`<option value="${v}">${v}</option>`).join('');
 }
-
 function fitToCenter(){
   if(!state.armatureDisplay) return;
   const w = state.app.renderer.width, h = state.app.renderer.height;
   state.armatureDisplay.x = w/2; state.armatureDisplay.y = h/2;
-  // 以 800x600 为参考（DragonBones 默认画布）
   const s = Math.min(w/800, h/600) * 1.0;
   state.scale = s; state.armatureDisplay.scale.set(s);
 }
-function setStatus(t){ $('#status').textContent = t; }
-
 function bindUI(){
-  // 文件选择
-  $('#file').addEventListener('change', e => loadFromFiles(e.target.files));
+  $('#pickVisible').addEventListener('click', ()=> $('#filePick').click());
+  $('#filePick').addEventListener('change', e => loadFromFiles(e.target.files, {preserve:false}));
 
-  // 示例按钮（假设在同目录存在 danyao_* 三件套）
-  $('#demoBtn').addEventListener('click', async ()=>{
-    const loader = new PIXI.Loader();
-    loader.add('ske','danyao_ske.json').add('tex','danyao_tex.json').load((_,res)=>{
-      const baseTex = PIXI.BaseTexture.from(res.tex.data.imagePath || 'danyao_tex.png');
-      buildScene(res.ske.data, res.tex.data, baseTex);
-    });
+  $('#demoBtn').addEventListener('click', ()=>{
+    captureView();
+    loadFromHttpPaths({ ske:'danyao_ske.json', tex:'danyao_tex.json', png:'danyao_tex.png' }, {preserve:view.has});
   });
 
-  // 下拉切换
+  $('#reloadBtn').addEventListener('click', async ()=>{
+    captureView();
+    try{
+      if (state.lastSource === 'http' && state.lastHttp){
+        loadFromHttpPaths(state.lastHttp, {preserve:view.has});
+        return;
+      }
+      if (state.lastSource === 'files'){
+        if ('showDirectoryPicker' in window) {
+          const ok = await reloadFromHandles(); // 内部带 preserve:true
+          if (ok) { setStatus('已从目录读取最新内容'); return; }
+        }
+        setStatus('请选择需重新加载的文件（建议与上次相同：' +
+          `${state.lastFileNames?.skeName || 'ske.json'}` + ' / ' +
+          `${state.lastFileNames?.texName || 'tex.json'}` +
+          `${state.lastFileNames?.pngName ? ' / '+state.lastFileNames.pngName : ''}` + '）');
+        $('#filePick').click();
+        return;
+      }
+      setStatus('还没有可刷新资源，请先加载一次。');
+    }catch(e){
+      setStatus('重新加载失败：' + (e?.message || e));
+      console.error(e);
+    }
+  });
+
   $('#armSel').addEventListener('change', ()=>{ buildArmature($('#armSel').value); updateAnimationList(state.skeData || {}); });
   $('#animSel').addEventListener('change', playCurrentAnimation);
 
-  // 播放控制
   $('#play').addEventListener('click', ()=>{
     if(!state.armatureDisplay) return;
     const anim = state.armatureDisplay.animation;
@@ -260,7 +493,6 @@ function bindUI(){
     $('#animSel').value = list[ni]; playCurrentAnimation();
   });
 
-  // 其他设置
   $('#loop').addEventListener('change', ()=>{ saveSettings(); playCurrentAnimation(); });
   $('#speed').addEventListener('change', ()=>{ saveSettings(); playCurrentAnimation(); });
   $('#bg').addEventListener('change', ()=>{
@@ -270,26 +502,29 @@ function bindUI(){
   });
   $('#fit').addEventListener('click', fitToCenter);
 
-  // 拖拽加载
   const drop = $('#drop');
   window.addEventListener('dragover', e=>{ e.preventDefault(); drop.style.display='flex'; drop.style.pointerEvents='auto'; });
   window.addEventListener('dragleave', e=>{ drop.style.display='none'; drop.style.pointerEvents='none'; });
   window.addEventListener('drop', e=>{
     e.preventDefault(); drop.style.display='none'; drop.style.pointerEvents='none';
-    if (e.dataTransfer?.files?.length) loadFromFiles(e.dataTransfer.files);
+    if (e.dataTransfer?.files?.length) loadFromFiles(e.dataTransfer.files, {preserve:false});
   });
 
-  // 窗口变化
-  window.addEventListener('resize', fitToCenter);
+  window.addEventListener('resize', ()=>{ /* 保留当前中心/缩放不自动改动 */ });
 }
 
 /* ---------------- 启动 ---------------- */
-(function start(){
-  if(!window.PIXI || !window.dragonBones){ alert('未加载本地库：请确保 libs/ 中三个 js 存在且先后顺序正确'); return; }
+(async function start(){
+  if(!window.PIXI || !window.dragonBones){ alert('未加载本地库：请确保 libs/ 中三个 js 存在且顺序正确'); return; }
   loadSettings();
   initPixi();
   bindUI();
-  setStatus('等待加载文件：拖入 *_ske.json、*_tex.json、.png（可选）');
+  // 启动时尝试恢复已保存的目录句柄，减少后续授权
+  try{
+    const saved = await idbGet('handles');
+    if (saved?.dir && saved?.files){ state.dirHandle=saved.dir; state.fileHandles=saved.files; }
+  }catch(e){}
+  setStatus('等待加载：点“选择文件”或拖入 *_ske.json、*_tex.json、(可选) .png；或点击“加载示例”。');
 })();
 </script>
 </body>
